@@ -93,6 +93,7 @@ cc_library(
     copts = [
         "-Wno-sign-compare",
         "-U_XOPEN_SOURCE",
+        '-DHAVE_LIB_GFLAGS',
     ],
     includes = ["./src"],
     linkopts = select({
@@ -120,19 +121,26 @@ cc_library(
 genrule(
     name = "run_configure",
     srcs = [
-        "README",
-        "Makefile.in",
-        "config.guess",
-        "config.sub",
-        "install-sh",
-        "ltmain.sh",
-        "missing",
+        "configure.ac",
         "libglog.pc.in",
-        "src/config.h.in",
+        "m4/ac_have_attribute.m4",
+        "m4/ac_have_builtin_expect.m4",
+        "m4/ac_have_sync_val_compare_and_swap.m4",
+        "m4/ac_rwlock.m4",
+        "m4/acx_pthread.m4",
+        "m4/google_namespace.m4",
+        "m4/lt~obsolete.m4",
+        "m4/ltsugar.m4",
+        "m4/namespaces.m4",
+        "m4/pc_from_ucontext.m4",
+        "m4/stl_namespace.m4",
+        "m4/using_operator.m4",
+        "Makefile.am",
         "src/glog/logging.h.in",
         "src/glog/raw_logging.h.in",
         "src/glog/stl_logging.h.in",
         "src/glog/vlog_is_on.h.in",
+        "README.md"
     ],
     outs = [
         "config.h.tmp",
@@ -141,14 +149,16 @@ genrule(
         "src/glog/stl_logging.h",
         "src/glog/vlog_is_on.h",
     ],
-    cmd = "$(location :configure)" +
-          "&& cp -v src/config.h $(location config.h.tmp) " +
-          "&& cp -v src/glog/logging.h $(location src/glog/logging.h.tmp) " +
-          "&& cp -v src/glog/raw_logging.h $(location src/glog/raw_logging.h) " +
-          "&& cp -v src/glog/stl_logging.h $(location src/glog/stl_logging.h) " +
-          "&& cp -v src/glog/vlog_is_on.h $(location src/glog/vlog_is_on.h) ",
+    cmd = "pushd external/com_github_glog_glog " +
+          "&& ./autogen.sh && ./configure" +
+          "&& popd " +
+          "&& cp -v external/com_github_glog_glog/src/config.h $(location config.h.tmp) " +
+          "&& cp -v external/com_github_glog_glog/src/glog/logging.h $(location src/glog/logging.h.tmp) " +
+          "&& cp -v external/com_github_glog_glog/src/glog/raw_logging.h $(location src/glog/raw_logging.h) " +
+          "&& cp -v external/com_github_glog_glog/src/glog/stl_logging.h $(location src/glog/stl_logging.h) " +
+          "&& cp -v external/com_github_glog_glog/src/glog/vlog_is_on.h $(location src/glog/vlog_is_on.h) ",
     tools = [
-        "configure",
+        "autogen.sh",
     ],
 )
 
@@ -538,7 +548,7 @@ IOS_ARM_CONFIG = """
 #define PACKAGE_NAME "glog"
 
 /* Define to the full name and version of this package. */
-#define PACKAGE_STRING "glog 0.3.5"
+#define PACKAGE_STRING "glog 0.4.0"
 
 /* Define to the one symbol short name of this package. */
 #define PACKAGE_TARNAME "glog"
@@ -547,7 +557,7 @@ IOS_ARM_CONFIG = """
 #define PACKAGE_URL ""
 
 /* Define to the version of this package. */
-#define PACKAGE_VERSION "0.3.5"
+#define PACKAGE_VERSION "0.4.0"
 
 /* How to access the PC from a struct ucontext */
 /* #undef PC_FROM_UCONTEXT */
@@ -569,7 +579,7 @@ IOS_ARM_CONFIG = """
 #define TEST_SRC_DIR "external/com_google_glog"
 
 /* Version number of package */
-#define VERSION "0.3.5"
+#define VERSION "0.4.0"
 
 /* Stops putting the code inside the Google namespace */
 #define _END_GOOGLE_NAMESPACE_ }

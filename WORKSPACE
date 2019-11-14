@@ -61,9 +61,9 @@ http_archive(
 # glog
 http_archive(
     name = "com_github_glog_glog",
-    url = "https://github.com/google/glog/archive/v0.3.5.zip",
-    sha256 = "267103f8a1e9578978aa1dc256001e6529ef593e5aea38193d31c2872ee025e8",
-    strip_prefix = "glog-0.3.5",
+    url = "https://github.com/google/glog/archive/v0.4.0.zip",
+    sha256 = "9e1b54eb2782f53cd8af107ecf08d2ab64b8d0dc2b7f5594472f3bd63ca85cdc",
+    strip_prefix = "glog-0.4.0",
     build_file = "@//third_party:glog.BUILD",
     patches = [
         "@//third_party:com_github_glog_glog_9779e5ea6ef59562b030248947f787d1256132ae.diff"
