@@ -15,6 +15,7 @@
 // A simple example to print out "Hello World!" from a MediaPipe graph.
 
 #include "mediapipe/framework/calculator_graph.h"
+#include "mediapipe/framework/port/commandlineflags.h"
 #include "mediapipe/framework/port/logging.h"
 #include "mediapipe/framework/port/parse_text_proto.h"
 #include "mediapipe/framework/port/status.h"
@@ -61,6 +62,7 @@ namespace mediapipe {
 
 int main(int argc, char** argv) {
   google::InitGoogleLogging(argv[0]);
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
   CHECK(mediapipe::PrintHelloWorld().ok());
   return 0;
 }
