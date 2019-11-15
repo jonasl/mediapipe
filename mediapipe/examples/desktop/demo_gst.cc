@@ -72,8 +72,7 @@ public:
     }
 
     if (buffer) {
-      // Copy the frame.
-      // TODO: No copies, ever. Need to be able to wrap GstBuffer in ImageFrame.
+      // Wrap the buffer in an ImageFrame.
       // TODO: Also return timestamp.
       // TODO: convert from stride to mediapipe alignment. For now just support
       // alignment 1, i.e. (width % stride) == 0. Coral Dev Board GPU will always
@@ -82,28 +81,27 @@ public:
       last_frame_ = absl::Now();
 
       GstVideoMeta *meta = gst_buffer_get_video_meta(buffer);
+      CHECK_EQ(meta->n_planes, 1);  // Only one plane for RGB.
       LOG(INFO) << absl::StrFormat("Frame: %ux%u, stride %d, ts %" GST_TIME_FORMAT
         " since_last %.2f ms (%.2f fps)",
         meta->width, meta->height, meta->stride[0],
         GST_TIME_ARGS(GST_BUFFER_TIMESTAMP(buffer)),
         since_last_ms, 1000 / since_last_ms);
 
-      auto frame = absl::make_unique<mediapipe::ImageFrame>(
-          mediapipe::ImageFormat::SRGB, meta->width, meta->height,
-          1 /* tightly packed */);
-
       // Map buffer for reading.
+      // TODO: Is writing to the buffer important here?
       GstMapInfo map;
       CHECK(gst_buffer_map(buffer, &map, GST_MAP_READ));
-      CHECK_GE(frame->PixelDataSize(), map.size);
 
-      // Copy the pixels.
-      // TODO: Stop crying.
-      memcpy(frame->MutablePixelData(), map.data, map.size);
+      // Deleter for unmapping and unreffing.
+      auto deleter = [buffer, &map](uint8*) {
+        gst_buffer_unmap(buffer, &map);
+        gst_buffer_unref(buffer);
+      };
 
-      gst_buffer_unmap(buffer, &map);
-      gst_buffer_unref(buffer);
-      return frame;
+      return absl::make_unique<mediapipe::ImageFrame>(
+          mediapipe::ImageFormat::SRGB, meta->width, meta->height,
+          meta->stride[0], map.data, deleter);
     }
     return nullptr;
   }
