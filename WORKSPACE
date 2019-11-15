@@ -136,6 +136,15 @@ new_local_repository(
     path = "/usr",
 )
 
+# Please run
+# $ sudo apt-get install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+#                        gstreamer1.0-plugins-good
+new_local_repository(
+    name = "linux_gstreamer",
+    build_file = "@//third_party:gstreamer_linux.BUILD",
+    path = "/usr",
+)
+
 new_local_repository(
     name = "linux_ffmpeg",
     build_file = "@//third_party:ffmpeg_linux.BUILD",

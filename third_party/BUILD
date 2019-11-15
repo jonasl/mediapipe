@@ -128,3 +128,13 @@ aar_import(
     name = "camera2",
     aar = "camera-camera2-1.0.0-alpha01.aar",
 )
+
+cc_library(
+    name = "gstreamer",
+    visibility = ["//visibility:public"],
+    deps = select({
+        "//conditions:default": [
+            "@linux_gstreamer//:gstreamer",
+        ],
+    }),
+)
