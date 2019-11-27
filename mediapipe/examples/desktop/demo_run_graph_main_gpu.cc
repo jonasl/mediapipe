@@ -15,18 +15,23 @@
 // An example of sending OpenCV webcam frames into a MediaPipe graph.
 // This example requires a linux computer and a GPU with EGL support drivers.
 
+#include <gst/gst.h>
+#include <gst/gl/gstglcontext.h>
+#include <gst/gl/gstgldisplay.h>
+#include <gst/gl/gstglmemory.h>
+
+#include "absl/strings/str_format.h"
 #include "mediapipe/framework/calculator_framework.h"
+#include "mediapipe/framework/calculator_graph.h"
 #include "mediapipe/framework/formats/image_frame.h"
 #include "mediapipe/framework/formats/image_frame_opencv.h"
 #include "mediapipe/framework/port/commandlineflags.h"
 #include "mediapipe/framework/port/file_helpers.h"
-#include "mediapipe/framework/port/opencv_highgui_inc.h"
-#include "mediapipe/framework/port/opencv_imgproc_inc.h"
-#include "mediapipe/framework/port/opencv_video_inc.h"
 #include "mediapipe/framework/port/parse_text_proto.h"
 #include "mediapipe/framework/port/status.h"
 #include "mediapipe/gpu/gl_calculator_helper.h"
 #include "mediapipe/gpu/gpu_buffer.h"
+#include "mediapipe/gpu/gpu_buffer_format.h"
 #include "mediapipe/gpu/gpu_shared_data_internal.h"
 
 constexpr char kInputStream[] = "input_video";
@@ -36,141 +41,266 @@ constexpr char kWindowName[] = "MediaPipe";
 DEFINE_string(
     calculator_graph_config_file, "",
     "Name of file containing text format CalculatorGraphConfig proto.");
-DEFINE_string(input_video_path, "",
-              "Full path of video to load. "
-              "If not provided, attempt to use a webcam.");
-DEFINE_string(output_video_path, "",
-              "Full path of where to save result (.mp4 only). "
-              "If not provided, show result in a window.");
+DEFINE_int32(input_video_width, 640, "Input video width");
+DEFINE_int32(input_video_height, 480, "Input video height");
 
-::mediapipe::Status RunMPPGraph() {
-  std::string calculator_graph_config_contents;
-  MP_RETURN_IF_ERROR(mediapipe::file::GetContents(
-      FLAGS_calculator_graph_config_file, &calculator_graph_config_contents));
-  LOG(INFO) << "Get calculator graph config contents: "
-            << calculator_graph_config_contents;
-  mediapipe::CalculatorGraphConfig config =
+class GstWrapper
+{
+public:
+  GstWrapper() {
+    gst_init(nullptr, nullptr);
+
+    // TODO: This needs to be configurable, support MJPEG/h264 cameras,
+    // v4l2 device selection, video decoding etc.
+    // For now use gst_parse_launch for convenience.
+    std::string spec = absl::StrFormat("v4l2src ! video/x-raw,width=%d,height=%d ! "
+      " glupload ! glcolorconvert ! glvideoflip video-direction=horiz name=flip ! "
+      " glimagesink name=glsink",
+      FLAGS_input_video_width, FLAGS_input_video_height);
+    LOG(INFO) << "Parsing: " << spec;
+
+    pipeline_ = gst_parse_launch(spec.c_str(), /* TODO: pass in and parse GError */ nullptr);
+
+    GstElement *element;
+    CHECK(element = GST_ELEMENT(gst_bin_get_by_name(GST_BIN(pipeline_), "glsink")));
+
+    // Disabling sync on the sink is required when our processing latency is high,
+    // or the sink will just drop all frames it considers late.
+    // TODO: For non live (i.e. camera) sources consider dropping frames instead
+    // of delaying them.
+    g_object_set(element, "sync", FALSE, nullptr);
+    gst_object_unref(element);
+
+    CHECK(element = GST_ELEMENT(gst_bin_get_by_name(GST_BIN(pipeline_), "flip")));
+    // Set up a pad probe to where we swap out the camera frames for mediapipe
+    // output frames.
+    GstPad *pad = gst_element_get_static_pad(element, "src");
+    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER,
+        reinterpret_cast<GstPadProbeCallback>(GstWrapper::OnPadProbeBuffer),
+        this, nullptr);
+    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM,
+        reinterpret_cast<GstPadProbeCallback>(GstWrapper::OnPadProbeQuery),
+        this, nullptr);
+
+    gst_object_unref(pad);
+    gst_object_unref(element);
+
+    // TODO: sync bus handler to catch errors.
+  }
+
+  ::mediapipe::Status Start() {
+    std::string calculator_graph_config_contents;
+    MP_RETURN_IF_ERROR(mediapipe::file::GetContents(
+        FLAGS_calculator_graph_config_file, &calculator_graph_config_contents));
+    mediapipe::CalculatorGraphConfig config =
       mediapipe::ParseTextProtoOrDie<mediapipe::CalculatorGraphConfig>(
           calculator_graph_config_contents);
+    LOG(INFO) << "Initialize the calculator graph.";
+    MP_RETURN_IF_ERROR(graph_.Initialize(config));
 
-  LOG(INFO) << "Initialize the calculator graph.";
-  mediapipe::CalculatorGraph graph;
-  MP_RETURN_IF_ERROR(graph.Initialize(config));
+    // TODO: Proper state change error handling.
 
-  LOG(INFO) << "Initialize the GPU.";
-  ASSIGN_OR_RETURN(auto gpu_resources, mediapipe::GpuResources::Create());
-  MP_RETURN_IF_ERROR(graph.SetGpuResources(std::move(gpu_resources)));
-  mediapipe::GlCalculatorHelper gpu_helper;
-  gpu_helper.InitializeForTest(graph.GetGpuResources().get());
+    // GL contexts are created in the READY state.
+    LOG(INFO) << "Setting GStreamer to READY";
+    gst_element_set_state(pipeline_, GST_STATE_READY);
+    CHECK_NE(gst_element_get_state (pipeline_, nullptr, nullptr, GST_CLOCK_TIME_NONE),
+        GST_STATE_CHANGE_FAILURE);
 
-  LOG(INFO) << "Initialize the camera or load the video.";
-  cv::VideoCapture capture;
-  const bool load_video = !FLAGS_input_video_path.empty();
-  if (load_video) {
-    capture.open(FLAGS_input_video_path);
-  } else {
-    capture.open(0);
+    GstElement *element;
+    CHECK(element = GST_ELEMENT(gst_bin_get_by_name(GST_BIN(pipeline_), "glsink")));
+    g_object_get(G_OBJECT(element), "context", &gst_gl_context_, nullptr);
+    gst_object_unref(element);
+    CHECK(gst_gl_context_) << "Couldn't get GstGLContext";
+    CHECK_EQ(gst_gl_context_get_gl_platform(gst_gl_context_), GST_GL_PLATFORM_EGL);
+
+    // Configure context sharing with mediapipe.
+    LOG(INFO) << "Initialize the GPU.";
+    GstGLDisplay *gst_display = gst_gl_context_get_display(gst_gl_context_);
+    ASSIGN_OR_RETURN(auto gpu_resources, mediapipe::GpuResources::Create(
+        reinterpret_cast<mediapipe::PlatformGlContext>(gst_gl_context_get_gl_context(gst_gl_context_)),
+        reinterpret_cast<mediapipe::PlatformDisplay>(gst_gl_display_get_handle(gst_display))));
+    MP_RETURN_IF_ERROR(graph_.SetGpuResources(std::move(gpu_resources)));
+    gpu_helper_.InitializeForTest(graph_.GetGpuResources().get());
+
+    gst_object_unref(gst_display);
+
+    LOG(INFO) << "Start running the calculator graph.";
+    status_or_poller_ = graph_.AddOutputStreamPoller(kOutputStream);
+    CHECK(status_or_poller_.ok());
+    MP_RETURN_IF_ERROR(graph_.StartRun({}));
+
+    LOG(INFO) << "Setting GStreamer to PLAYING";
+    gst_element_set_state(pipeline_, GST_STATE_PLAYING);
+
+    // Wait until up and running or failed.
+    CHECK_NE(gst_element_get_state (pipeline_, nullptr, nullptr, GST_CLOCK_TIME_NONE),
+          GST_STATE_CHANGE_FAILURE);
+    LOG(INFO) << "GStreamer now in PLAYING state";
+    return ::mediapipe::OkStatus();
   }
-  RET_CHECK(capture.isOpened());
 
-  cv::VideoWriter writer;
-  const bool save_video = !FLAGS_output_video_path.empty();
-  if (save_video) {
-    LOG(INFO) << "Prepare video writer.";
-    cv::Mat test_frame;
-    capture.read(test_frame);                    // Consume first frame.
-    capture.set(cv::CAP_PROP_POS_AVI_RATIO, 0);  // Rewind to beginning.
-    writer.open(FLAGS_output_video_path,
-                mediapipe::fourcc('a', 'v', 'c', '1'),  // .mp4
-                capture.get(cv::CAP_PROP_FPS), test_frame.size());
-    RET_CHECK(writer.isOpened());
-  } else {
-    cv::namedWindow(kWindowName, /*flags=WINDOW_AUTOSIZE*/ 1);
+  void Stop() {
+    LOG(INFO) << "Setting GStreamer to NULL";
+    gst_element_set_state(pipeline_, GST_STATE_NULL);
   }
 
-  LOG(INFO) << "Start running the calculator graph.";
-  ASSIGN_OR_RETURN(mediapipe::OutputStreamPoller poller,
-                   graph.AddOutputStreamPoller(kOutputStream));
-  MP_RETURN_IF_ERROR(graph.StartRun({}));
+  ~GstWrapper() {
+    Stop();
+    gst_object_unref(gst_gl_context_);
+    gst_object_unref(pipeline_);
+  }
 
-  LOG(INFO) << "Start grabbing and processing frames.";
-  size_t frame_timestamp = 0;
-  bool grab_frames = true;
-  while (grab_frames) {
-    // Capture opencv camera or video frame.
-    cv::Mat camera_frame_raw;
-    capture >> camera_frame_raw;
-    if (camera_frame_raw.empty()) break;  // End of video.
-    cv::Mat camera_frame;
-    cv::cvtColor(camera_frame_raw, camera_frame, cv::COLOR_BGR2RGB);
-    if (!load_video) {
-      cv::flip(camera_frame, camera_frame, /*flipcode=HORIZONTAL*/ 1);
+  static GstPadProbeReturn OnPadProbeBuffer(GstPad *pad, GstPadProbeInfo *info, GstWrapper *self) {
+    return self->HandlePadProbeBuffer(info);
+  }
+
+  static GstPadProbeReturn OnPadProbeQuery(GstPad *pad, GstPadProbeInfo *info, GstWrapper *self) {
+    return self->HandlePadProbeQuery(info);
+  }
+
+  static void OnPacketDestroy(mediapipe::Packet *packet) {
+    delete packet;
+  }
+
+private:
+  // Called in GStreamer streaming thread context.
+  GstPadProbeReturn HandlePadProbeBuffer(GstPadProbeInfo *info) {
+    CHECK(GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER);
+    GstBuffer *in_buf = gst_pad_probe_info_get_buffer(info);
+
+    // Push input texture into mediapipe graph.
+    GstMemory *memory = gst_buffer_peek_memory(in_buf, 0);
+    GstVideoMeta *meta = gst_buffer_get_video_meta(in_buf);
+    CHECK_EQ(meta->n_planes, 1);  // Only one plane for RGB.
+    CHECK(gst_is_gl_memory(memory));
+    guint input_texture_id = gst_gl_memory_get_texture_id(GST_GL_MEMORY_CAST(memory));
+
+    // TODO: Wait on sync object in MP GL context.
+    auto input_packet = mediapipe::MakePacket<mediapipe::GpuBuffer>(
+      mediapipe::GlTextureBuffer::Wrap(GL_TEXTURE_2D, input_texture_id,
+          meta->width, meta->height,
+          mediapipe::GpuBufferFormat::kBGRA32,
+          nullptr));
+    graph_.AddPacketToInputStream(kInputStream,
+        input_packet.At(mediapipe::Timestamp(frame_timestamp_++)));
+
+    // Get the mediapipe output packet. Since we're in GStreamer streaming
+    // thread context any long blocking operation here slows down the pipeline.
+    // We're essentially acting as a GStreamer filter.
+    mediapipe::OutputStreamPoller& poller = status_or_poller_.ValueOrDie();
+    mediapipe::Packet *out_packet = new mediapipe::Packet();
+    CHECK(poller.Next(out_packet));
+
+    GLuint out_tex_id;
+    int out_width;
+    int out_height;
+    gpu_helper_.RunInGlContext(
+      [&out_packet, &out_tex_id, &out_width, &out_height, this]() -> ::mediapipe::Status {
+        auto& gpu_frame = out_packet->Get<mediapipe::GpuBuffer>();
+        auto texture = gpu_helper_.CreateSourceTexture(gpu_frame);
+        out_tex_id = texture.name();
+        out_width = texture.width();
+        out_height = texture.height();
+        return ::mediapipe::OkStatus();
+      });
+
+    double since_last_ms = absl::ToDoubleMilliseconds(absl::Now() - last_frame_);
+    last_frame_ = absl::Now();
+    LOG(INFO) << absl::StrFormat("tex %u %dx%d %.2f ms (%.2f fps)",
+        out_tex_id, out_width, out_height,
+        since_last_ms, 1000 / since_last_ms);
+
+    // TODO: Wait on sync object in GST GL context.
+
+    // We now have the output texture, wrap it in a GstBuffer and replace input.
+    GstVideoInfo vinfo;
+    gst_video_info_set_format(&vinfo, GST_VIDEO_FORMAT_RGBA, meta->width, meta->height);
+    GstGLAllocationParams *params = reinterpret_cast<GstGLAllocationParams*>(
+        gst_gl_video_allocation_params_new_wrapped_texture(
+          gst_gl_context_,
+          NULL /* alloc_params */,
+          &vinfo,
+          0 /* plane */,
+          NULL /* valign */,
+          GST_GL_TEXTURE_TARGET_2D,
+          GST_GL_RGBA,
+          out_tex_id,
+          out_packet,
+          reinterpret_cast<GDestroyNotify>(GstWrapper::OnPacketDestroy)));
+
+    GstAllocator *gl_allocator = gst_allocator_find(GST_GL_MEMORY_ALLOCATOR_NAME);
+    CHECK(gl_allocator);
+    GstGLMemory *gl_memory = GST_GL_MEMORY_CAST(gst_gl_base_memory_alloc(
+        GST_GL_BASE_MEMORY_ALLOCATOR(gl_allocator), params));
+    CHECK(gl_memory);
+    CHECK_EQ(gst_gl_memory_get_texture_id(gl_memory), out_tex_id);
+    gst_gl_allocation_params_free(params);
+    gst_object_unref(gl_allocator);
+    
+
+    GstBuffer *out_buf = gst_buffer_new();
+    CHECK(gst_buffer_copy_into(out_buf, in_buf,
+        static_cast<GstBufferCopyFlags>(GST_BUFFER_COPY_FLAGS | GST_BUFFER_COPY_TIMESTAMPS),
+        0 /* offset */,
+        0 /* size, not used since not copying data */));
+    gst_buffer_add_video_meta(out_buf, meta->flags, meta->format, meta->width, meta->height);
+    gst_buffer_append_memory(out_buf, GST_MEMORY_CAST(gl_memory));
+
+    // Replace the original buffer with ours.
+    info->data = out_buf;
+    gst_buffer_unref(in_buf);
+
+    return GST_PAD_PROBE_OK;
+  }
+
+  // Called in GStreamer streaming thread context.
+  GstPadProbeReturn HandlePadProbeQuery(GstPadProbeInfo *info) {
+    CHECK(GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM);
+    GstQuery *query = gst_pad_probe_info_get_query(info);
+
+    // Clobber declared sink support for affine transformations so glvideoflip
+    // gives us flipped buffer in the buffer probe.
+    if (GST_QUERY_TYPE(query) == GST_QUERY_ALLOCATION) {
+      LOG(INFO) << "Forwarding allocation query";
+      GstElement *element;
+      GstPad *pad;
+      CHECK(element = GST_ELEMENT(gst_bin_get_by_name(GST_BIN(pipeline_), "glsink")));
+      CHECK(pad = gst_element_get_static_pad(element, "sink"));
+      if (gst_pad_query(pad, query)) {
+        LOG(INFO) << "Sink query succeeded";
+        guint index;
+        if (gst_query_find_allocation_meta(query, GST_VIDEO_AFFINE_TRANSFORMATION_META_API_TYPE, &index)) {
+          LOG(INFO) << "Remove meta API at index " << index;
+          gst_query_remove_nth_allocation_meta(query, index);
+        }
+      }
+      gst_object_unref(pad);
+      gst_object_unref(element);
+      return GST_PAD_PROBE_HANDLED;
     }
 
-    // Wrap Mat into an ImageFrame.
-    auto input_frame = absl::make_unique<mediapipe::ImageFrame>(
-        mediapipe::ImageFormat::SRGB, camera_frame.cols, camera_frame.rows,
-        mediapipe::ImageFrame::kGlDefaultAlignmentBoundary);
-    cv::Mat input_frame_mat = mediapipe::formats::MatView(input_frame.get());
-    camera_frame.copyTo(input_frame_mat);
-
-    // Prepare and add graph input packet.
-    MP_RETURN_IF_ERROR(
-        gpu_helper.RunInGlContext([&input_frame, &frame_timestamp, &graph,
-                                   &gpu_helper]() -> ::mediapipe::Status {
-          // Convert ImageFrame to GpuBuffer.
-          auto texture = gpu_helper.CreateSourceTexture(*input_frame.get());
-          auto gpu_frame = texture.GetFrame<mediapipe::GpuBuffer>();
-          glFlush();
-          texture.Release();
-          // Send GPU image packet into the graph.
-          MP_RETURN_IF_ERROR(graph.AddPacketToInputStream(
-              kInputStream, mediapipe::Adopt(gpu_frame.release())
-                                .At(mediapipe::Timestamp(frame_timestamp++))));
-          return ::mediapipe::OkStatus();
-        }));
-
-    // Get the graph result packet, or stop if that fails.
-    mediapipe::Packet packet;
-    if (!poller.Next(&packet)) break;
-    std::unique_ptr<mediapipe::ImageFrame> output_frame;
-
-    // Convert GpuBuffer to ImageFrame.
-    MP_RETURN_IF_ERROR(gpu_helper.RunInGlContext(
-        [&packet, &output_frame, &gpu_helper]() -> ::mediapipe::Status {
-          auto& gpu_frame = packet.Get<mediapipe::GpuBuffer>();
-          auto texture = gpu_helper.CreateSourceTexture(gpu_frame);
-          output_frame = absl::make_unique<mediapipe::ImageFrame>(
-              mediapipe::ImageFormatForGpuBufferFormat(gpu_frame.format()),
-              gpu_frame.width(), gpu_frame.height(),
-              mediapipe::ImageFrame::kGlDefaultAlignmentBoundary);
-          gpu_helper.BindFramebuffer(texture);
-          const auto info =
-              mediapipe::GlTextureInfoForGpuBufferFormat(gpu_frame.format(), 0);
-          glReadPixels(0, 0, texture.width(), texture.height(), info.gl_format,
-                       info.gl_type, output_frame->MutablePixelData());
-          glFlush();
-          texture.Release();
-          return ::mediapipe::OkStatus();
-        }));
-
-    // Convert back to opencv for display or saving.
-    cv::Mat output_frame_mat = mediapipe::formats::MatView(output_frame.get());
-    cv::cvtColor(output_frame_mat, output_frame_mat, cv::COLOR_RGB2BGR);
-    if (save_video) {
-      writer.write(output_frame_mat);
-    } else {
-      cv::imshow(kWindowName, output_frame_mat);
-      // Press any key to exit.
-      const int pressed_key = cv::waitKey(5);
-      if (pressed_key >= 0 && pressed_key != 255) grab_frames = false;
-    }
+    return GST_PAD_PROBE_OK;
   }
 
-  LOG(INFO) << "Shutting down.";
-  if (writer.isOpened()) writer.release();
-  MP_RETURN_IF_ERROR(graph.CloseInputStream(kInputStream));
-  return graph.WaitUntilDone();
+  mediapipe::CalculatorGraph graph_;
+  mediapipe::StatusOrPoller status_or_poller_;
+  mediapipe::GlCalculatorHelper gpu_helper_;
+  GstElement *pipeline_ = nullptr;
+  GstGLContext *gst_gl_context_ = nullptr;
+  size_t frame_timestamp_ = 0;  // TODO: Use real timestamp
+  absl::Mutex mutex_;
+  absl::Time last_frame_ = absl::Now();
+};
+
+
+::mediapipe::Status RunMPPGraph() {
+  GstWrapper gst;
+  MP_RETURN_IF_ERROR(gst.Start());
+
+  std::string line;
+  std::getline(std::cin, line);
+  gst.Stop();
+  return ::mediapipe::OkStatus();
 }
 
 int main(int argc, char** argv) {

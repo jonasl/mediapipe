@@ -145,6 +145,13 @@ new_local_repository(
     path = "/usr",
 )
 
+# sudo apt-get install libedgetpu-dev
+new_local_repository(
+    name = "edgetpu",
+    build_file = "@//third_party:edgetpu_linux.BUILD",
+    path = "/usr",
+)
+
 new_local_repository(
     name = "linux_ffmpeg",
     build_file = "@//third_party:ffmpeg_linux.BUILD",

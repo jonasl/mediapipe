@@ -228,6 +228,7 @@ cc_library(
         "@org_tensorflow//tensorflow/lite/kernels:builtin_ops",
         "//mediapipe/framework/stream_handler:fixed_size_input_stream_handler",
         "//mediapipe/framework/port:ret_check",
+        "@edgetpu//:edgetpu",  # xxx
     ] + select({
         "//mediapipe/gpu:disable_gpu": [],
         "//mediapipe:ios": [

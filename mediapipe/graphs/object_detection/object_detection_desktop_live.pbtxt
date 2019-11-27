@@ -2,7 +2,8 @@
 # Used in the examples in
 # mediapipie/examples/desktop/object_detection:object_detection_cpu.
 
-# Images on CPU coming into and out of the graph.
+
+# Images on GPU coming into and out of the graph.
 input_stream: "input_video"
 output_stream: "output_video"
 
@@ -37,22 +38,37 @@ node {
 # detection model used in this graph is agnostic to that deformation.
 node: {
   calculator: "ImageTransformationCalculator"
-  input_stream: "IMAGE:throttled_input_video"
-  output_stream: "IMAGE:transformed_input_video"
+  input_stream: "IMAGE_GPU:throttled_input_video"
+  output_stream: "IMAGE_GPU:transformed_input_video"
   node_options: {
     [type.googleapis.com/mediapipe.ImageTransformationCalculatorOptions] {
-      output_width: 320
-      output_height: 320
+      output_width: 300
+      output_height: 300
     }
   }
+}
+
+# Transfers the input image from GPU to CPU memory for the purpose of
+# demonstrating a CPU-based pipeline. Note that the input image on GPU has the
+# origin defined at the bottom-left corner (OpenGL convention). As a result,
+# the transferred image on CPU also shares the same representation.
+node: {
+  calculator: "GpuBufferToImageFrameCalculator"
+  input_stream: "transformed_input_video"
+  output_stream: "transformed_input_video_cpu"
 }
 
 # Converts the transformed input image on CPU into an image tensor stored as a
 # TfLiteTensor.
 node {
   calculator: "TfLiteConverterCalculator"
-  input_stream: "IMAGE:transformed_input_video"
+  input_stream: "IMAGE:transformed_input_video_cpu"
   output_stream: "TENSORS:image_tensor"
+  node_options: {
+    [type.googleapis.com/mediapipe.TfLiteConverterCalculatorOptions] {
+      use_quantized_tensors: true
+    }
+  }
 }
 
 # Runs a TensorFlow Lite model on CPU that takes an image tensor and outputs a
@@ -64,7 +80,7 @@ node {
   output_stream: "TENSORS:detection_tensors"
   node_options: {
     [type.googleapis.com/mediapipe.TfLiteInferenceCalculatorOptions] {
-      model_path: "mediapipe/models/ssdlite_object_detection.tflite"
+      model_path: "mediapipe/examples/coral/models/object-detector-quantized_edgetpu.tflite"
     }
   }
 }
@@ -79,8 +95,8 @@ node {
       num_layers: 6
       min_scale: 0.2
       max_scale: 0.95
-      input_size_height: 320
-      input_size_width: 320
+      input_size_height: 300
+      input_size_width: 300
       anchor_offset_x: 0.5
       anchor_offset_y: 0.5
       strides: 16
@@ -147,7 +163,7 @@ node {
   output_stream: "output_detections"
   node_options: {
     [type.googleapis.com/mediapipe.DetectionLabelIdToTextCalculatorOptions] {
-      label_map_path: "mediapipe/models/ssdlite_object_detection_labelmap.txt"
+      label_map_path: "mediapipe/examples/coral/models/object_detection_labelmap.txt"
     }
   }
 }
@@ -168,7 +184,7 @@ node {
 # Draws annotations and overlays them on top of the input images.
 node {
   calculator: "AnnotationOverlayCalculator"
-  input_stream: "INPUT_FRAME:throttled_input_video"
+  input_stream: "INPUT_FRAME_GPU:throttled_input_video"
   input_stream: "render_data"
-  output_stream: "OUTPUT_FRAME:output_video"
+  output_stream: "OUTPUT_FRAME_GPU:output_video"
 }

@@ -21,13 +21,17 @@ cc_library(
             "include/gstreamer-1.0/gst/*.h",
             "include/gstreamer-1.0/gst/app/*.h",
             "include/gstreamer-1.0/gst/base/*.h",
+            "include/gstreamer-1.0/gst/gl/*.h",
+            "lib/aarch64-linux-gnu/gstreamer-1.0/include/gst/gl/*.h",
             "include/gstreamer-1.0/gst/video/*.h",
         ]),
-    includes = ["include/gstreamer-1.0/"],
+    includes = ["include/gstreamer-1.0/", "lib/aarch64-linux-gnu/gstreamer-1.0/include"],
     linkstatic = 0,
     visibility = ["//visibility:public"],
     deps = [
         ":glib",
+        ":gbm",
+        ":drm",
     ],
 )
 
@@ -48,6 +52,39 @@ cc_library(
             "lib/aarch64-linux-gnu/glib-2.0/include/*",
         ]),
     includes = ["include/glib-2.0", "lib/aarch64-linux-gnu/glib-2.0/include"],
+    linkstatic = 0,
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "gbm",
+    srcs = glob(
+        [
+            "lib/aarch64-linux-gnu/libgbm.so",
+        ],
+    ),
+    hdrs = glob(
+        [
+            "include/gbm.h",
+        ]),
+    includes = ["include"],
+    linkstatic = 0,
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "drm",
+    srcs = glob(
+        [
+            "lib/aarch64-linux-gnu/libdrm.so",
+        ],
+    ),
+    hdrs = glob(
+        [
+            "include/xf86drm.h",
+            "include/libdrm/*.h"
+        ]),
+    includes = ["include", "include/libdrm"],
     linkstatic = 0,
     visibility = ["//visibility:public"],
 )

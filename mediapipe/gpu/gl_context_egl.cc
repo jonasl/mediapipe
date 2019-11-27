@@ -69,18 +69,19 @@ static void EnsureEglThreadRelease() {
 
 GlContext::StatusOrGlContext GlContext::Create(std::nullptr_t nullp,
                                                bool create_thread) {
-  return Create(EGL_NO_CONTEXT, create_thread);
+  return Create(EGL_NO_CONTEXT, EGL_DEFAULT_DISPLAY, create_thread);
 }
 
 GlContext::StatusOrGlContext GlContext::Create(const GlContext& share_context,
                                                bool create_thread) {
-  return Create(share_context.context_, create_thread);
+  return Create(share_context.context_, share_context.native_display_, create_thread);
 }
 
 GlContext::StatusOrGlContext GlContext::Create(EGLContext share_context,
+                                               PlatformDisplay display,
                                                bool create_thread) {
   std::shared_ptr<GlContext> context(new GlContext());
-  MP_RETURN_IF_ERROR(context->CreateContext(share_context));
+  MP_RETURN_IF_ERROR(context->CreateContext(share_context, display));
   MP_RETURN_IF_ERROR(context->FinishInitialization(create_thread));
   return std::move(context);
 }
@@ -144,11 +145,12 @@ GlContext::StatusOrGlContext GlContext::Create(EGLContext share_context,
   return ::mediapipe::OkStatus();
 }
 
-::mediapipe::Status GlContext::CreateContext(EGLContext external_context) {
+::mediapipe::Status GlContext::CreateContext(EGLContext external_context, NativeDisplayType native_display) {
   EGLint major = 0;
   EGLint minor = 0;
 
-  display_ = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+  native_display_ = native_display;
+  display_ = eglGetDisplay(native_display_);
   RET_CHECK(display_ != EGL_NO_DISPLAY)
       << "eglGetDisplay() returned error " << std::showbase << std::hex
       << eglGetError();

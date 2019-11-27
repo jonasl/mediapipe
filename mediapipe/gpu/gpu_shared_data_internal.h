@@ -46,13 +46,13 @@ class GpuResources {
       ::mediapipe::StatusOr<std::shared_ptr<GpuResources>>;
 
   static StatusOrGpuResources Create();
-  static StatusOrGpuResources Create(PlatformGlContext external_context);
+  static StatusOrGpuResources Create(PlatformGlContext external_context, PlatformDisplay display=kPlatformDisplayDefault);
 
   // The destructor must be defined in the implementation file so that on iOS
   // the correct ARC release calls are generated.
   ~GpuResources();
 
-  explicit GpuResources(PlatformGlContext external_context);
+  explicit GpuResources(PlatformGlContext external_context, PlatformDisplay display=kPlatformDisplayDefault);
 
   // Shared GL context for calculators.
   // TODO: require passing a context or node identifier.

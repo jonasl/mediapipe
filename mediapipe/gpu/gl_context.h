@@ -124,7 +124,9 @@ typedef EMSCRIPTEN_WEBGL_CONTEXT_HANDLE PlatformGlContext;
 constexpr PlatformGlContext kPlatformGlContextNone = 0;
 #elif HAS_EGL
 typedef EGLContext PlatformGlContext;
+typedef NativeDisplayType PlatformDisplay;
 constexpr PlatformGlContext kPlatformGlContextNone = EGL_NO_CONTEXT;
+constexpr PlatformDisplay kPlatformDisplayDefault = EGL_DEFAULT_DISPLAY;
 #elif HAS_EAGL
 typedef EAGLContext* PlatformGlContext;
 constexpr PlatformGlContext kPlatformGlContextNone = nil;
@@ -158,6 +160,7 @@ class GlContext : public std::enable_shared_from_this<GlContext> {
   static StatusOrGlContext Create(const GlContext& share_context,
                                   bool create_thread);
   static StatusOrGlContext Create(PlatformGlContext share_context,
+                                  PlatformDisplay display,
                                   bool create_thread);
 #if HAS_EAGL
   static StatusOrGlContext Create(EAGLSharegroup* sharegroup,
@@ -288,10 +291,11 @@ class GlContext : public std::enable_shared_from_this<GlContext> {
   EMSCRIPTEN_WEBGL_CONTEXT_HANDLE context_ = 0;
   EmscriptenWebGLContextAttributes attrs_;
 #elif HAS_EGL
-  ::mediapipe::Status CreateContext(EGLContext share_context);
+  ::mediapipe::Status CreateContext(EGLContext share_context, NativeDisplayType native_display);
   ::mediapipe::Status CreateContextInternal(EGLContext share_context,
                                             int gl_version);
 
+  NativeDisplayType native_display_ = EGL_DEFAULT_DISPLAY;
   EGLDisplay display_ = EGL_NO_DISPLAY;
   EGLConfig config_;
   EGLSurface surface_ = EGL_NO_SURFACE;

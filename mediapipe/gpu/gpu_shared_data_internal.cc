@@ -66,14 +66,14 @@ static const std::string& SharedContextKey() {
 }
 
 GpuResources::StatusOrGpuResources GpuResources::Create() {
-  return Create(kPlatformGlContextNone);
+  return Create(kPlatformGlContextNone, kPlatformDisplayDefault);
 }
 
 GpuResources::StatusOrGpuResources GpuResources::Create(
-    PlatformGlContext external_context) {
+    PlatformGlContext external_context, PlatformDisplay display) {
   ASSIGN_OR_RETURN(
       std::shared_ptr<GlContext> context,
-      GlContext::Create(external_context, kGlContextUseDedicatedThread));
+      GlContext::Create(external_context, display, kGlContextUseDedicatedThread));
   std::shared_ptr<GpuResources> gpu_resources(
       new GpuResources(std::move(context)));
   return gpu_resources;

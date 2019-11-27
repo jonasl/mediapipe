@@ -48,6 +48,7 @@ cc_library(
         "//mediapipe/framework/port:opencv_video",
         "//mediapipe/framework/port:parse_text_proto",
         "//mediapipe/framework/port:status",
+        "//third_party:gstreamer",
     ],
 )
 
@@ -72,6 +73,7 @@ cc_library(
         "//mediapipe/gpu:gl_calculator_helper",
         "//mediapipe/gpu:gpu_buffer",
         "//mediapipe/gpu:gpu_shared_data_internal",
+        "//third_party:gstreamer",
     ],
 )
 
@@ -91,5 +93,14 @@ cc_binary(
         "//mediapipe/framework/port:status",
         "//third_party:gstreamer",
         "@com_google_absl//absl/synchronization",
+    ],
+)
+
+cc_binary(
+    name = "gbm",
+    srcs = ["gbm.cc"],
+    deps = [
+        "//third_party:gstreamer",
+        "@com_google_absl//absl/time",
     ],
 )

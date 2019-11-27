@@ -319,6 +319,12 @@ REGISTER_CALCULATOR(TfLiteConverterCalculator);
     interpreter_->AllocateTensors();
 
     // Copy image data into tensor.
+    // TODO: This is super inefficient. Copies should always be avoided at
+    // all costs. TFLite can operate on pointers passed to it, and if input
+    // data is packed as expected, i.e. row stride == width, input can be
+    // used as is. Thus image_frame should use alignment 1 if at all possible.
+    // When not possible data should be copied row by row to take advantage
+    // of optimized memcpy routines in libc, never one byte at the time.
     if (use_quantized_tensors_) {
       const int width_padding =
           image_frame.WidthStep() / image_frame.ByteDepth() - width * channels;

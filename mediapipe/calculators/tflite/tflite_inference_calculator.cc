@@ -51,6 +51,8 @@
 #include "tensorflow/lite/delegates/gpu/metal_delegate.h"
 #endif  // iOS
 
+#define DRISHTI_EDGE_TPU
+
 namespace {
 
 #if !defined(MEDIAPIPE_DISABLE_GPU) && !defined(__EMSCRIPTEN__) && \
@@ -63,6 +65,28 @@ typedef id<MTLBuffer> GpuTensor;
 // Round up n to next multiple of m.
 size_t RoundUp(size_t n, size_t m) { return ((n + m - 1) / m) * m; }  // NOLINT
 }  // namespace
+
+#ifdef DRISHTI_EDGE_TPU
+#include "edgetpu.h"
+std::shared_ptr<edgetpu::EdgeTpuContext> edgetpu_context =
+    edgetpu::EdgeTpuManager::GetSingleton()->OpenDevice();
+std::unique_ptr<tflite::Interpreter> BuildEdgeTpuInterpreter(
+    const tflite::FlatBufferModel& model,
+    tflite::ops::builtin::BuiltinOpResolver* resolver,
+    edgetpu::EdgeTpuContext* edgetpu_context) {
+  resolver->AddCustom(edgetpu::kCustomOp, edgetpu::RegisterCustomOp());
+  std::unique_ptr<tflite::Interpreter> interpreter;
+  if (tflite::InterpreterBuilder(model, *resolver)(&interpreter) != kTfLiteOk) {
+    std::cerr << "Failed to build edge TPU interpreter." << std::endl;
+  }
+  interpreter->SetExternalContext(kTfLiteEdgeTpuContext, edgetpu_context);
+  interpreter->SetNumThreads(1);
+  if (interpreter->AllocateTensors() != kTfLiteOk) {
+    std::cerr << "Failed to allocate edge TPU tensors." << std::endl;
+  }
+  return interpreter;
+}
+#endif  // DRISHTI_EDGE_TPU
 
 // TfLiteInferenceCalculator File Layout:
 //  * Header
@@ -425,6 +449,9 @@ REGISTER_CALCULATOR(TfLiteInferenceCalculator);
 #endif
     delegate_ = nullptr;
   }
+#ifdef DRISHTI_EDGE_TPU
+  edgetpu_context.reset();
+#endif
   return ::mediapipe::OkStatus();
 }
 
@@ -458,6 +485,20 @@ REGISTER_CALCULATOR(TfLiteInferenceCalculator);
   model_ = tflite::FlatBufferModel::BuildFromFile(model_path_.c_str());
   RET_CHECK(model_);
 
+#ifdef DRISHTI_EDGE_TPU
+  if (cc->InputSidePackets().HasTag("CUSTOM_OP_RESOLVER")) {
+    auto& op_resolver = cc->InputSidePackets()
+                            .Tag("CUSTOM_OP_RESOLVER")
+                            .Get<tflite::ops::builtin::BuiltinOpResolver>();
+    interpreter_ = BuildEdgeTpuInterpreter(
+        *model_, (tflite::ops::builtin::BuiltinOpResolver*)&op_resolver,
+        edgetpu_context.get());
+  } else {
+    tflite::ops::builtin::BuiltinOpResolver op_resolver;
+    interpreter_ =
+        BuildEdgeTpuInterpreter(*model_, &op_resolver, edgetpu_context.get());
+  }
+#else
   if (cc->InputSidePackets().HasTag("CUSTOM_OP_RESOLVER")) {
     const auto& op_resolver =
         cc->InputSidePackets()
@@ -468,6 +509,7 @@ REGISTER_CALCULATOR(TfLiteInferenceCalculator);
     const tflite::ops::builtin::BuiltinOpResolver op_resolver;
     tflite::InterpreterBuilder(*model_, op_resolver)(&interpreter_);
   }
+#endif
 
   RET_CHECK(interpreter_);
 
