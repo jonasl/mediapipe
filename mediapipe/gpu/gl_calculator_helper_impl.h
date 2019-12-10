@@ -63,6 +63,20 @@ class GlCalculatorHelperImpl {
   // For internal use.
   void ReadTexture(const GlTexture& texture, void* output, size_t size);
 
+#if HAS_EGL_IMAGE_GBM
+  bool CreateEGLImageDMA(int width, int height, GpuBufferFormat format,
+      EGLImage *image, int *dma_fd, int *stride);
+  void DestroyEGLImageDMA(EGLImage *image, int *dma_fd);
+  void MapDMA(int dma_fd, size_t size, void **data);
+  void UnmapDMA(void **data, size_t size);
+  void BeginCpuAccessDMA(int dma_fd, bool read, bool write);
+  void EndCpuAccessDMA(int dma_fd, bool read, bool write);
+  void SetEGLSync(EGLSync *sync);
+  void WaitEGLSync(EGLSync *sync);
+  void DestroyEGLSync(EGLSync *sync);
+  void EGLImageTargetTexture2DOES(EGLImage image);
+#endif
+
  private:
   // Makes a GpuBuffer accessible as a texture in the GL context.
   GlTexture MapGpuBuffer(const GpuBuffer& gpu_buffer, int plane);
@@ -83,6 +97,13 @@ class GlCalculatorHelperImpl {
   GLuint framebuffer_ = 0;
 
   GpuResources& gpu_resources_;
+
+#if HAS_EGL_IMAGE_GBM
+  int drm_fd_ = -1;
+  struct gbm_device *gbm_device_ = nullptr;
+  bool drm_modifiers_;
+  PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES_;
+#endif
 };
 
 }  // namespace mediapipe

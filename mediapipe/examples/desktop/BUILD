@@ -73,7 +73,9 @@ cc_library(
         "//mediapipe/gpu:gl_calculator_helper",
         "//mediapipe/gpu:gpu_buffer",
         "//mediapipe/gpu:gpu_shared_data_internal",
+        "//third_party:gbm",
         "//third_party:gstreamer",
+        "//third_party:gtk",
     ],
 )
 
@@ -96,11 +98,3 @@ cc_binary(
     ],
 )
 
-cc_binary(
-    name = "gbm",
-    srcs = ["gbm.cc"],
-    deps = [
-        "//third_party:gstreamer",
-        "@com_google_absl//absl/time",
-    ],
-)

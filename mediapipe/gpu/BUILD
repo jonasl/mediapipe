@@ -655,6 +655,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":gl_calculator_helper",
+        ":gl_quad_renderer",
         "//mediapipe/framework:calculator_framework",
         "//mediapipe/framework:timestamp",
         "//mediapipe/framework/formats:image_frame",

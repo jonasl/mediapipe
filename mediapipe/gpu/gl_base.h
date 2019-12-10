@@ -53,10 +53,19 @@
 #else
 
 #define HAS_EGL 1
+#define HAS_EGL_IMAGE_GBM 1 // TODO: define externally.
 
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
+
+#if HAS_EGL_IMAGE_GBM
+#include <gbm.h>
+#ifndef EGL_EGLEXT_PROTOTYPES
+#define EGL_EGLEXT_PROTOTYPES 1
+#endif
+#include <EGL/eglext.h>
+#endif
 
 #ifdef __ANDROID__
 // Weak-link all GL APIs included from this point on.

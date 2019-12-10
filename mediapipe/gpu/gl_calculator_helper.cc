@@ -135,4 +135,47 @@ GlContext& GlCalculatorHelper::GetGlContext() const {
   return impl_->GetGlContext();
 }
 
+#if HAS_EGL_IMAGE_GBM
+bool GlCalculatorHelper::CreateEGLImageDMA(int width, int height,
+      GpuBufferFormat format, EGLImage *image, int *dma_fd, int *stride) {
+  return impl_->CreateEGLImageDMA(width, height, format, image, dma_fd, stride);
+}
+
+void GlCalculatorHelper::DestroyEGLImageDMA(EGLImage *image, int *dma_fd) {
+  impl_->DestroyEGLImageDMA(image, dma_fd);
+}
+
+void GlCalculatorHelper::MapDMA(int dma_fd, size_t size, void **data) {
+  impl_->MapDMA(dma_fd, size, data);
+}
+
+void GlCalculatorHelper::UnmapDMA(void **data, size_t size) {
+  impl_->UnmapDMA(data, size);
+}
+
+void GlCalculatorHelper::BeginCpuAccessDMA(int dma_fd, bool read, bool write) {
+  impl_->BeginCpuAccessDMA(dma_fd, read, write);
+}
+
+void GlCalculatorHelper::EndCpuAccessDMA(int dma_fd, bool read, bool write) {
+  impl_->EndCpuAccessDMA(dma_fd, read, write);
+}
+
+void GlCalculatorHelper::SetEGLSync(EGLSync *sync) {
+  impl_->SetEGLSync(sync);
+}
+
+void GlCalculatorHelper::WaitEGLSync(EGLSync *sync) {
+  impl_->WaitEGLSync(sync);
+}
+
+void GlCalculatorHelper::DestroyEGLSync(EGLSync *sync) {
+  impl_->DestroyEGLSync(sync);
+}
+
+void GlCalculatorHelper::EGLImageTargetTexture2DOES(EGLImage image) {
+  impl_->EGLImageTargetTexture2DOES(image);
+}
+#endif
+
 }  // namespace mediapipe

@@ -14,6 +14,11 @@
 //
 // An example of sending OpenCV webcam frames into a MediaPipe graph.
 
+#include <gst/gst.h>
+#include <gst/app/gstappsink.h>
+#include <gst/video/video.h>
+
+#include "absl/strings/str_format.h"
 #include "mediapipe/framework/calculator_framework.h"
 #include "mediapipe/framework/formats/image_frame.h"
 #include "mediapipe/framework/formats/image_frame_opencv.h"
@@ -28,6 +33,7 @@
 constexpr char kInputStream[] = "input_video";
 constexpr char kOutputStream[] = "output_video";
 constexpr char kWindowName[] = "MediaPipe";
+constexpr uint32_t kCameraFrameTimeoutMs = 1000;
 
 DEFINE_string(
     calculator_graph_config_file, "",
@@ -38,6 +44,139 @@ DEFINE_string(input_video_path, "",
 DEFINE_string(output_video_path, "",
               "Full path of where to save result (.mp4 only). "
               "If not provided, show result in a window.");
+DEFINE_int32(input_video_width, 640, "Input video width");
+DEFINE_int32(input_video_height, 480, "Input video height");
+
+class SimpleGstCamera
+{
+public:
+
+  SimpleGstCamera() {
+    gst_init (nullptr, nullptr);
+
+    // TODO: This needs to be configurable, support MJPEG/h264 cameras,
+    // v4l2 device selection etc. For now use gst_parse_launch for convenience.
+    std::string spec = absl::StrFormat("v4l2src ! video/x-raw,width=%d,height=%d ! "
+      " glfilterbin filter=\"glvideoflip video-direction=horiz ! glcolorscale\" !"
+      " video/x-raw,format=RGB ! appsink name=appsink",
+      FLAGS_input_video_width, FLAGS_input_video_height);
+    LOG(INFO) << "Parsing: " << spec;
+
+    pipeline_ = gst_parse_launch(spec.c_str(), /* TODO: pass in and parse GError */ NULL);
+    appsink_ = GST_APP_SINK(gst_bin_get_by_name (GST_BIN(pipeline_), "appsink"));
+    g_object_set(G_OBJECT(appsink_), "emit-signals", TRUE, "sync", FALSE, nullptr);
+    g_signal_connect(appsink_, "new-sample",
+        G_CALLBACK (SimpleGstCamera::OnNewSample), this);
+    // TODO: sync bus handler to catch errors.
+  }
+
+  void Start() {
+    gst_element_set_state(pipeline_, GST_STATE_PLAYING);
+
+    // Wait until  up and running or failed.
+    // TODO: Proper error handling.
+    CHECK_NE(gst_element_get_state (pipeline_, NULL, NULL, GST_CLOCK_TIME_NONE),
+          GST_STATE_CHANGE_FAILURE);
+  }
+
+  void Stop() {
+    gst_element_set_state(pipeline_, GST_STATE_NULL);
+  }
+
+  double frame_rate() {
+    if (fps_ == 0.0) {
+      GetFrame();
+    }
+    return fps_;
+  }
+
+  std::unique_ptr<mediapipe::ImageFrame> GetFrame(uint32_t timeout_ms=kCameraFrameTimeoutMs) {
+    GstBuffer *buffer = nullptr;
+    {
+      absl::MutexLock lock(&mutex_);
+      mutex_.AwaitWithTimeout(
+          absl::Condition(this, &SimpleGstCamera::HaveBuffer),
+          absl::Milliseconds(timeout_ms));
+      buffer = buffer_;
+      buffer_ = nullptr;
+    }
+
+    if (buffer) {
+      // Wrap the buffer in an ImageFrame.
+      // TODO: Also return timestamp.
+      double since_last_ms = absl::ToDoubleMilliseconds(absl::Now() - last_frame_);
+      last_frame_ = absl::Now();
+
+      GstVideoMeta *meta = gst_buffer_get_video_meta(buffer);
+      CHECK_EQ(meta->n_planes, 1);  // Only one plane for RGB.
+      LOG(INFO) << absl::StrFormat("Frame: %ux%u, stride %d, ts %" GST_TIME_FORMAT
+        " since_last %.2f ms (%.2f fps)",
+        meta->width, meta->height, meta->stride[0],
+        GST_TIME_ARGS(GST_BUFFER_TIMESTAMP(buffer)),
+        since_last_ms, 1000 / since_last_ms);
+
+      // Map buffer for reading.
+      // TODO: Is writing to the buffer important here?
+      GstMapInfo map;
+      CHECK(gst_buffer_map(buffer, &map, GST_MAP_READ));
+
+      // Deleter for unmapping and unreffing.
+      auto deleter = [buffer, map](uint8*) {
+        gst_buffer_unmap(buffer, const_cast<GstMapInfo*>(&map));
+        gst_buffer_unref(buffer);
+      };
+
+      return absl::make_unique<mediapipe::ImageFrame>(
+          mediapipe::ImageFormat::SRGB, meta->width, meta->height,
+          meta->stride[0], map.data, deleter);
+    }
+    return nullptr;
+  }
+
+  ~SimpleGstCamera() {
+    Stop();
+    gst_object_unref(appsink_);
+    gst_object_unref(pipeline_);
+  }
+
+  static GstFlowReturn OnNewSample(GstAppSink *appsink, SimpleGstCamera *cam) {
+    return cam->HandleNewSample(appsink);
+  }
+
+private:
+  bool HaveBuffer() {
+    return buffer_ != nullptr;
+  }
+
+  GstFlowReturn HandleNewSample(GstAppSink *appsink) {
+    GstSample *sample = gst_app_sink_pull_sample(appsink);
+    GstBuffer *new_buffer = gst_sample_get_buffer(sample);
+
+    {
+      absl::MutexLock lock(&mutex_);
+      if (fps_ == 0.0) {
+        // Populate fps_ with info from caps.
+        gint fps_n, fps_d;
+        GstCaps *caps = gst_sample_get_caps(sample);
+        GstStructure *s = gst_caps_get_structure (caps, 0);
+        gst_structure_get_fraction (s, "framerate", &fps_n, &fps_d);
+        fps_ = double(fps_n) / double(fps_d);
+        gst_caps_unref(caps);
+      }
+      gst_buffer_replace(&buffer_, new_buffer);
+    }
+
+    gst_sample_unref(sample);
+    return GST_FLOW_OK;
+  }
+
+  double fps_ = 0.0;
+  GstElement *pipeline_ = nullptr;
+  GstAppSink *appsink_ = nullptr;
+  GstBuffer *buffer_ = nullptr;
+  absl::Time last_frame_ = absl::Now();
+  absl::Mutex mutex_;
+};
 
 ::mediapipe::Status RunMPPGraph() {
   std::string calculator_graph_config_contents;
@@ -54,25 +193,19 @@ DEFINE_string(output_video_path, "",
   MP_RETURN_IF_ERROR(graph.Initialize(config));
 
   LOG(INFO) << "Initialize the camera or load the video.";
-  cv::VideoCapture capture;
-  const bool load_video = !FLAGS_input_video_path.empty();
-  if (load_video) {
-    capture.open(FLAGS_input_video_path);
-  } else {
-    capture.open(0);
-  }
-  RET_CHECK(capture.isOpened());
+  SimpleGstCamera camera;
+  camera.Start();
+  LOG(INFO) << "Camera FPS: " << camera.frame_rate();
+  // TODO add support for video decode.
 
   cv::VideoWriter writer;
   const bool save_video = !FLAGS_output_video_path.empty();
   if (save_video) {
     LOG(INFO) << "Prepare video writer.";
-    cv::Mat test_frame;
-    capture.read(test_frame);                    // Consume first frame.
-    capture.set(cv::CAP_PROP_POS_AVI_RATIO, 0);  // Rewind to beginning.
+    auto test_frame = camera.GetFrame();  // Consume first frame.
     writer.open(FLAGS_output_video_path,
                 mediapipe::fourcc('a', 'v', 'c', '1'),  // .mp4
-                capture.get(cv::CAP_PROP_FPS), test_frame.size());
+                camera.frame_rate(),cv::Size(test_frame->Width(), test_frame->Height()));
     RET_CHECK(writer.isOpened());
   } else {
     cv::namedWindow(kWindowName, /*flags=WINDOW_AUTOSIZE*/ 1);
@@ -87,22 +220,9 @@ DEFINE_string(output_video_path, "",
   size_t frame_timestamp = 0;
   bool grab_frames = true;
   while (grab_frames) {
-    // Capture opencv camera or video frame.
-    cv::Mat camera_frame_raw;
-    capture >> camera_frame_raw;
-    if (camera_frame_raw.empty()) break;  // End of video.
-    cv::Mat camera_frame;
-    cv::cvtColor(camera_frame_raw, camera_frame, cv::COLOR_BGR2RGB);
-    if (!load_video) {
-      cv::flip(camera_frame, camera_frame, /*flipcode=HORIZONTAL*/ 1);
-    }
-
-    // Wrap Mat into an ImageFrame.
-    auto input_frame = absl::make_unique<mediapipe::ImageFrame>(
-        mediapipe::ImageFormat::SRGB, camera_frame.cols, camera_frame.rows,
-        mediapipe::ImageFrame::kDefaultAlignmentBoundary);
-    cv::Mat input_frame_mat = mediapipe::formats::MatView(input_frame.get());
-    camera_frame.copyTo(input_frame_mat);
+    // Capture flipped RGB camera frame.
+    auto input_frame = camera.GetFrame();
+    CHECK(input_frame.get()) << "Couldn't get camera frame";  // TODO error handling
 
     // Send image packet into the graph.
     MP_RETURN_IF_ERROR(graph.AddPacketToInputStream(

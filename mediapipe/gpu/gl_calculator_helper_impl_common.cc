@@ -16,15 +16,53 @@
 #include "mediapipe/gpu/gpu_buffer_format.h"
 #include "mediapipe/gpu/gpu_shared_data_internal.h"
 
+#if HAS_EGL_IMAGE_GBM
+#include <fcntl.h>
+#include <linux/dma-buf.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#define HANDLE_EINTR(x)                                           \
+  ({                                                              \
+    int eintr_wrapper_result;                                     \
+    do {                                                          \
+      eintr_wrapper_result = (x);                                 \
+    } while (eintr_wrapper_result == -1 && errno == EINTR);       \
+    eintr_wrapper_result;                                         \
+  })
+// Avoid dependency on libdrm for this define only.
+#ifndef DRM_FORMAT_MOD_LINEAR
+#define DRM_FORMAT_MOD_LINEAR (uint64_t)0
+#endif
+#endif
+
 namespace mediapipe {
 
 GlCalculatorHelperImpl::GlCalculatorHelperImpl(CalculatorContext* cc,
                                                GpuResources* gpu_resources)
     : gpu_resources_(*gpu_resources) {
   gl_context_ = gpu_resources_.gl_context(cc);
+#if HAS_EGL_IMAGE_GBM
+  drm_fd_ = open("/dev/dri/renderD128", O_RDWR);
+  CHECK_NE(drm_fd_, -1) << "Failed to open DRM render node";
+  gbm_device_ = gbm_create_device(drm_fd_);
+  CHECK(gbm_device_) << "Failed to create GBM device";
+  drm_modifiers_ = strstr(eglQueryString(gl_context_->egl_display(), EGL_EXTENSIONS),
+      "EGL_EXT_image_dma_buf_import_modifiers");
+  glEGLImageTargetTexture2DOES_ = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
+      eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+  CHECK(glEGLImageTargetTexture2DOES_) << "glEGLImageTargetTexture2DOES unsupported";
+#endif
 }
 
 GlCalculatorHelperImpl::~GlCalculatorHelperImpl() {
+#if HAS_EGL_IMAGE_GBM
+  if (gbm_device_) {
+    gbm_device_destroy(gbm_device_);
+  }
+  if (drm_fd_ > 0) {
+    close(drm_fd_);
+  }
+#endif
   RunInGlContext(
       [this] {
         if (framebuffer_) {
@@ -221,5 +259,146 @@ void GlCalculatorHelperImpl::ReadTexture(const GlTexture& texture, void* output,
                  GL_UNSIGNED_BYTE, output);
   }
 }
+
+#if HAS_EGL_IMAGE_GBM
+bool GlCalculatorHelperImpl::CreateEGLImageDMA(int width, int height,
+      GpuBufferFormat format, EGLImage *image, int *dma_fd, int *stride) {
+  // TODO: Support more formats?
+  uint32_t gbm_format;
+  switch (format) {
+    case GpuBufferFormat::kBGRA32:
+      gbm_format = GBM_FORMAT_ABGR8888;
+      break;
+    case GpuBufferFormat::kRGB24:
+      gbm_format = GBM_FORMAT_BGR888;
+      break;
+    default:
+      CHECK(false) << "Unsupported format for DMA buffer";
+      return false;
+  }
+
+  CHECK(gbm_device_is_format_supported(gbm_device_, gbm_format, GBM_BO_USE_RENDERING))
+      << "GBM impl. doesn't support format " << std::hex << gbm_format;
+
+  struct gbm_bo *bo = gbm_bo_create(gbm_device_, width, height, gbm_format, GBM_BO_USE_RENDERING);
+  CHECK(bo) << "Failed to create GBM buffer object";
+  uint32_t _stride = gbm_bo_get_stride(bo);
+
+  // Export dmabuf. We now own this fd and must close it when we're done.
+  // Once exported we can destroy the bo.
+  int fd = gbm_bo_get_fd(bo);
+  gbm_bo_destroy(bo);
+  CHECK_GE(fd, 0) << "Failed to export dmabuf";
+
+  // Create EGLImage.
+  int acnt = 0;
+  EGLAttrib attribs[32];
+  attribs[acnt++] = EGL_WIDTH;
+  attribs[acnt++] = width;
+  attribs[acnt++] = EGL_HEIGHT;
+  attribs[acnt++] = height;
+  attribs[acnt++] = EGL_LINUX_DRM_FOURCC_EXT;
+  attribs[acnt++] = gbm_format;
+
+  attribs[acnt++] = EGL_DMA_BUF_PLANE0_FD_EXT;
+  attribs[acnt++] = fd;  // Does not take ownership of fd.
+  attribs[acnt++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT;
+  attribs[acnt++] = 0;
+  attribs[acnt++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;
+  attribs[acnt++] = _stride;
+  if (drm_modifiers_) {
+    attribs[acnt++] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
+    attribs[acnt++] = DRM_FORMAT_MOD_LINEAR & 0xffffffff;
+    attribs[acnt++] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
+    attribs[acnt++] = (DRM_FORMAT_MOD_LINEAR >> 32) & 0xffffffff;
+  }
+  attribs[acnt] = EGL_NONE;
+
+  EGLImage _image = eglCreateImage(gl_context_->egl_display(), EGL_NO_CONTEXT,
+      EGL_LINUX_DMA_BUF_EXT, nullptr, attribs);
+  CHECK_NE(_image, EGL_NO_IMAGE_KHR) << "Failed to create EGLImage";
+
+  *image = _image;
+  *dma_fd = fd;
+  *stride = _stride;
+  return true;
+}
+
+void GlCalculatorHelperImpl::DestroyEGLImageDMA(EGLImage *image, int *dma_fd) {
+  if (*image != EGL_NO_IMAGE) {
+    eglDestroyImage(gl_context_->egl_display(), *image);
+    *image = EGL_NO_IMAGE;
+  }
+  if (*dma_fd > 0) {
+    close(*dma_fd);
+    *dma_fd = -1;
+  }
+}
+
+void GlCalculatorHelperImpl::MapDMA(int dma_fd, size_t size, void **data) {
+  *data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, dma_fd, 0);
+  CHECK_NE(*data, MAP_FAILED) << "Failed to mmap dmabuf: " << errno;
+}
+
+void GlCalculatorHelperImpl::UnmapDMA(void **data, size_t size) {
+  if (*data) {
+    int res = munmap(*data, size);
+    CHECK_EQ(res, 0) << "Failed to munmap dmabuf: " << errno;
+    *data = nullptr;
+  }
+}
+
+void GlCalculatorHelperImpl::BeginCpuAccessDMA(int dma_fd, bool read, bool write) {
+  struct dma_buf_sync sync_start = { 0 };
+  sync_start.flags = DMA_BUF_SYNC_START;
+  if (read) {
+    sync_start.flags |= DMA_BUF_SYNC_READ;
+  }
+  if (write) {
+    sync_start.flags |= DMA_BUF_SYNC_WRITE;
+  }
+  CHECK_EQ(HANDLE_EINTR(ioctl(dma_fd, DMA_BUF_IOCTL_SYNC, &sync_start)), 0);
+}
+
+void GlCalculatorHelperImpl::EndCpuAccessDMA(int dma_fd, bool read, bool write) {
+  struct dma_buf_sync sync_end = { 0 };
+  sync_end.flags = DMA_BUF_SYNC_END;
+  if (read) {
+    sync_end.flags |= DMA_BUF_SYNC_READ;
+  }
+  if (write) {
+    sync_end.flags |= DMA_BUF_SYNC_WRITE;
+  }
+  CHECK_EQ(HANDLE_EINTR(ioctl(dma_fd, DMA_BUF_IOCTL_SYNC, &sync_end)), 0);
+}
+
+void GlCalculatorHelperImpl::SetEGLSync(EGLSync *sync) {
+  DestroyEGLSync(sync);
+  *sync = eglCreateSync(gl_context_->egl_display(), EGL_SYNC_FENCE, NULL);
+  CHECK_NE(*sync, EGL_NO_SYNC);
+}
+
+void GlCalculatorHelperImpl::WaitEGLSync(EGLSync *sync) {
+  if (*sync != EGL_NO_SYNC) {
+    EGLint res;
+    do {
+      res = eglClientWaitSync(gl_context_->egl_display(),
+          *sync, EGL_SYNC_FLUSH_COMMANDS_BIT, 1000000000 /* 1s */ );
+    } while (res == EGL_TIMEOUT_EXPIRED);
+  }
+}
+
+void GlCalculatorHelperImpl::DestroyEGLSync(EGLSync *sync) {
+  if (*sync != EGL_NO_SYNC) {
+    eglDestroySync(gl_context_->egl_display(), *sync);
+    *sync = EGL_NO_SYNC;
+  }
+}
+
+void GlCalculatorHelperImpl::EGLImageTargetTexture2DOES(EGLImage image) {
+  glEGLImageTargetTexture2DOES_(GL_TEXTURE_2D, image);
+  CHECK_EQ(glGetError(), GL_NO_ERROR) << "glEGLImageTargetTexture2DOES failed";
+}
+#endif
 
 }  // namespace mediapipe

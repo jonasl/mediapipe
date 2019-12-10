@@ -138,3 +138,33 @@ cc_library(
         ],
     }),
 )
+
+cc_library(
+    name = "gbm",
+    visibility = ["//visibility:public"],
+    deps = select({
+        "//conditions:default": [
+            "@linux_gstreamer//:gbm",
+        ],
+    }),
+)
+
+cc_library(
+    name = "gtk",
+    visibility = ["//visibility:public"],
+    deps = select({
+        "//conditions:default": [
+            "@linux_gstreamer//:gtk",
+        ],
+    }),
+)
+
+cc_library(
+    name = "drm",
+    visibility = ["//visibility:public"],
+    deps = select({
+        "//conditions:default": [
+            "@linux_gstreamer//:drm",
+        ],
+    }),
+)

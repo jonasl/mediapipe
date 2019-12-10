@@ -152,6 +152,20 @@ class GlCalculatorHelper {
 
   GlContext& GetGlContext() const;
 
+#if HAS_EGL_IMAGE_GBM
+  bool CreateEGLImageDMA(int width, int height, GpuBufferFormat format,
+      EGLImage *image, int *dma_fd, int *stride);
+  void DestroyEGLImageDMA(EGLImage *image, int *dma_fd);
+  void MapDMA(int dma_fd, size_t size, void **data);
+  void UnmapDMA(void **data, size_t size);
+  void BeginCpuAccessDMA(int dma_fd, bool read, bool write);
+  void EndCpuAccessDMA(int dma_fd, bool read, bool write);
+  void SetEGLSync(EGLSync *sync);
+  void WaitEGLSync(EGLSync *sync);
+  void DestroyEGLSync(EGLSync *sync);
+  void EGLImageTargetTexture2DOES(EGLImage image);
+#endif
+
  private:
   std::unique_ptr<GlCalculatorHelperImpl> impl_;
 };

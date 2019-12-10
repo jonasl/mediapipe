@@ -14,6 +14,7 @@
 
 #include <memory>
 
+#include "absl/strings/str_format.h"
 #include "mediapipe/calculators/util/annotation_overlay_calculator.pb.h"
 #include "mediapipe/framework/calculator_framework.h"
 #include "mediapipe/framework/calculator_options.pb.h"
@@ -55,7 +56,11 @@ size_t RoundUp(size_t n, size_t m) { return ((n + m - 1) / m) * m; }  // NOLINT
 // When using GPU, this color will become transparent when the calculator
 // merges the annotation overlay with the image frame. As a result, drawing in
 // this color is not supported and it should be set to something unlikely used.
-constexpr int kAnnotationBackgroundColor[] = {100, 101, 102};
+// TODO: This value will be used for R, G and B. For performance reasons all
+// must be the same so we can memset instead of poking individual pixel bytes.
+// This mechanism should be replaced with drawing to RGBA texture and do full
+// alpha blending on the GPU.
+constexpr int kAnnotationBackgroundColor = 100;
 }  // namespace
 
 // A calculator for rendering data on images.
@@ -162,6 +167,13 @@ class AnnotationOverlayCalculator : public CalculatorBase {
   GLuint image_mat_tex_ = 0;  // Overlay drawing image for GPU.
   int width_ = 0;
   int height_ = 0;
+#if HAS_EGL_IMAGE_GBM
+  int stride_ = 0;
+  int dma_fd_ = -1;
+  EGLImage egl_image_ = EGL_NO_IMAGE;
+  void *map_data_ = nullptr;
+  size_t map_size_ = 0;
+#endif
 #endif  //  MEDIAPIPE_DISABLE_GPU
 };
 REGISTER_CALCULATOR(AnnotationOverlayCalculator);
@@ -294,6 +306,9 @@ REGISTER_CALCULATOR(AnnotationOverlayCalculator);
       gpu_initialized_ = true;
     }
 #endif  //  !MEDIAPIPE_DISABLE_GPU
+#if HAS_EGL_IMAGE_GBM
+    gpu_helper_.BeginCpuAccessDMA(dma_fd_, false /* read */, true /* write */);
+#endif
     MP_RETURN_IF_ERROR(CreateRenderTargetGpu(cc, image_mat));
   } else {
     MP_RETURN_IF_ERROR(CreateRenderTargetCpu(cc, image_mat, &target_format));
@@ -329,6 +344,9 @@ REGISTER_CALCULATOR(AnnotationOverlayCalculator);
 
   if (use_gpu_) {
 #if !defined(MEDIAPIPE_DISABLE_GPU)
+#if HAS_EGL_IMAGE_GBM
+    gpu_helper_.EndCpuAccessDMA(dma_fd_, false /* read */, true /* write */);
+#endif
     // Overlay rendered image in OpenGL, onto a copy of input.
     uchar* image_mat_ptr = image_mat->data;
     MP_RETURN_IF_ERROR(gpu_helper_.RunInGlContext(
@@ -353,6 +371,10 @@ REGISTER_CALCULATOR(AnnotationOverlayCalculator);
     program_ = 0;
     if (image_mat_tex_) glDeleteTextures(1, &image_mat_tex_);
     image_mat_tex_ = 0;
+#if HAS_EGL_IMAGE_GBM
+    gpu_helper_.UnmapDMA(&map_data_, map_size_);
+    gpu_helper_.DestroyEGLImageDMA(&egl_image_, &dma_fd_);
+#endif
   });
 #endif  //  !MEDIAPIPE_DISABLE_GPU
 
@@ -393,6 +415,9 @@ REGISTER_CALCULATOR(AnnotationOverlayCalculator);
   auto output_texture = gpu_helper_.CreateDestinationTexture(
       width_, height_, mediapipe::GpuBufferFormat::kBGRA32);
 
+#if HAS_EGL_IMAGE_GBM
+  // Texture is already "uploaded".
+#else
   // Upload render target to GPU.
   {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -402,6 +427,7 @@ REGISTER_CALCULATOR(AnnotationOverlayCalculator);
                     GL_UNSIGNED_BYTE, overlay_image);
     glBindTexture(GL_TEXTURE_2D, 0);
   }
+#endif
 
   // Blend overlay image in GPU shader.
   {
@@ -491,6 +517,11 @@ REGISTER_CALCULATOR(AnnotationOverlayCalculator);
 
 ::mediapipe::Status AnnotationOverlayCalculator::CreateRenderTargetGpu(
     CalculatorContext* cc, std::unique_ptr<cv::Mat>& image_mat) {
+#if HAS_EGL_IMAGE_GBM
+    CHECK(map_data_);
+    memset(map_data_, kAnnotationBackgroundColor, map_size_);
+#endif
+
 #if !defined(MEDIAPIPE_DISABLE_GPU)
   if (image_frame_available_) {
     const auto& input_frame =
@@ -502,15 +533,24 @@ REGISTER_CALCULATOR(AnnotationOverlayCalculator);
         format != mediapipe::ImageFormat::SRGB)
       RET_CHECK_FAIL() << "Unsupported GPU input format: " << format;
 
+#if HAS_EGL_IMAGE_GBM
+    image_mat = absl::make_unique<cv::Mat>(height_, width_, CV_8UC3, map_data_);
+#else
     image_mat = absl::make_unique<cv::Mat>(
         height_, width_, CV_8UC3,
-        cv::Scalar(kAnnotationBackgroundColor[0], kAnnotationBackgroundColor[1],
-                   kAnnotationBackgroundColor[2]));
+        cv::Scalar(kAnnotationBackgroundColor, kAnnotationBackgroundColor,
+                   kAnnotationBackgroundColor));
+#endif
   } else {
+#if HAS_EGL_IMAGE_GBM
+    // TODO: What's this case really for?
+    image_mat = absl::make_unique<cv::Mat>(height_, width_, CV_8UC3, map_data_);
+#else
     image_mat = absl::make_unique<cv::Mat>(
         options_.canvas_height_px(), options_.canvas_width_px(), CV_8UC3,
         cv::Scalar(options_.canvas_color().r(), options_.canvas_color().g(),
                    options_.canvas_color().b()));
+#endif
   }
 #endif  //  !MEDIAPIPE_DISABLE_GPU
 
@@ -627,9 +667,9 @@ REGISTER_CALCULATOR(AnnotationOverlayCalculator);
   glUniform1i(glGetUniformLocation(program_, "input_frame"), 1);
   glUniform1i(glGetUniformLocation(program_, "overlay"), 2);
   glUniform3f(glGetUniformLocation(program_, "transparent_color"),
-              kAnnotationBackgroundColor[0] / 255.0,
-              kAnnotationBackgroundColor[1] / 255.0,
-              kAnnotationBackgroundColor[2] / 255.0);
+              kAnnotationBackgroundColor / 255.0,
+              kAnnotationBackgroundColor / 255.0,
+              kAnnotationBackgroundColor / 255.0);
 
   // Init texture for opencv rendered frame.
   const auto& input_frame =
@@ -642,8 +682,18 @@ REGISTER_CALCULATOR(AnnotationOverlayCalculator);
   {
     glGenTextures(1, &image_mat_tex_);
     glBindTexture(GL_TEXTURE_2D, image_mat_tex_);
+#if HAS_EGL_IMAGE_GBM
+    CHECK(gpu_helper_.CreateEGLImageDMA(width_, height_, GpuBufferFormat::kRGB24,
+        &egl_image_, &dma_fd_, &stride_));
+    gpu_helper_.EGLImageTargetTexture2DOES(egl_image_);
+
+    // Map dmabuf for CPU access.
+    map_size_ = height_ * stride_;
+    gpu_helper_.MapDMA(dma_fd_, map_size_, &map_data_);
+#else
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width_, height_, 0, GL_RGB,
                  GL_UNSIGNED_BYTE, nullptr);
+#endif
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);

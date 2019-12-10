@@ -109,11 +109,18 @@ void GpuResources::PrepareGpuNode(CalculatorNode* node) {
   std::string node_type = node->GetCalculatorState().CalculatorType();
   std::string context_key;
 
+#if HAS_EGL_IMAGE_GBM
+  /* No need for a separate context when doing DMA transfers. */
+  bool gets_own_context = false;
+#else
   // TODO Allow calculators to request a separate context.
   // For now, white-list a few calculators to run in their own context.
   bool gets_own_context = (node_type == "ImageFrameToGpuBufferCalculator") ||
                           (node_type == "GpuBufferToImageFrameCalculator") ||
                           (node_type == "GlSurfaceSinkCalculator");
+#endif
+
+
 
   const auto& options = node->GetCalculatorState().Options<GlContextOptions>();
   if (options.has_gl_context_name() && !options.gl_context_name().empty()) {

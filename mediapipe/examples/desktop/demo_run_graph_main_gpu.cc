@@ -19,6 +19,9 @@
 #include <gst/gl/gstglcontext.h>
 #include <gst/gl/gstgldisplay.h>
 #include <gst/gl/gstglmemory.h>
+#include <gtk/gtk.h>
+#include <gdk/gdk.h>
+#include <gdk/gdkwayland.h>
 
 #include "absl/strings/str_format.h"
 #include "mediapipe/framework/calculator_framework.h"
@@ -34,6 +37,8 @@
 #include "mediapipe/gpu/gpu_buffer_format.h"
 #include "mediapipe/gpu/gpu_shared_data_internal.h"
 
+// #include <gdk/gdkx.h>
+
 constexpr char kInputStream[] = "input_video";
 constexpr char kOutputStream[] = "output_video";
 constexpr char kWindowName[] = "MediaPipe";
@@ -43,6 +48,8 @@ DEFINE_string(
     "Name of file containing text format CalculatorGraphConfig proto.");
 DEFINE_int32(input_video_width, 640, "Input video width");
 DEFINE_int32(input_video_height, 480, "Input video height");
+
+
 
 class GstWrapper
 {
@@ -54,6 +61,7 @@ public:
     // v4l2 device selection, video decoding etc.
     // For now use gst_parse_launch for convenience.
     std::string spec = absl::StrFormat("v4l2src ! video/x-raw,width=%d,height=%d ! "
+      " queue max-size-buffers=1 leaky=downstream ! "
       " glupload ! glcolorconvert ! glvideoflip video-direction=horiz name=flip ! "
       " glimagesink name=glsink",
       FLAGS_input_video_width, FLAGS_input_video_height);
@@ -62,14 +70,6 @@ public:
     pipeline_ = gst_parse_launch(spec.c_str(), /* TODO: pass in and parse GError */ nullptr);
 
     GstElement *element;
-    CHECK(element = GST_ELEMENT(gst_bin_get_by_name(GST_BIN(pipeline_), "glsink")));
-
-    // Disabling sync on the sink is required when our processing latency is high,
-    // or the sink will just drop all frames it considers late.
-    // TODO: For non live (i.e. camera) sources consider dropping frames instead
-    // of delaying them.
-    g_object_set(element, "sync", FALSE, nullptr);
-    gst_object_unref(element);
 
     CHECK(element = GST_ELEMENT(gst_bin_get_by_name(GST_BIN(pipeline_), "flip")));
     // Set up a pad probe to where we swap out the camera frames for mediapipe
@@ -85,7 +85,47 @@ public:
     gst_object_unref(pad);
     gst_object_unref(element);
 
-    // TODO: sync bus handler to catch errors.
+    CHECK(gl_sink_ = GST_ELEMENT(gst_bin_get_by_name(GST_BIN(pipeline_), "glsink")));
+
+    // Disabling sync on the sink is required when our processing latency is high,
+    // or the sink will just drop all frames it considers late.
+    // TODO: For non live (i.e. camera) sources consider dropping frames instead
+    // of delaying them.
+    g_object_set(gl_sink_, "sync", FALSE, nullptr);
+    g_object_set(gl_sink_, "qos", FALSE, nullptr);
+
+    // Set up GTK window.
+    window_ = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_default_size(GTK_WINDOW(window_), 1280, 720);
+    gtk_window_set_title(GTK_WINDOW(window_), "MediaPipe");
+    gtk_window_fullscreen(GTK_WINDOW(window_));
+    drawing_area_ = gtk_drawing_area_new();
+    g_signal_connect(drawing_area_, "configure-event", G_CALLBACK(GstWrapper::OnWidgetConfigure), this);
+    gtk_container_add(GTK_CONTAINER(window_), drawing_area_);
+    gtk_widget_realize(drawing_area_);
+
+    GdkWindow *gdk_window = gtk_widget_get_window(drawing_area_);
+    GdkDisplay *gdk_display = gdk_window_get_display(gdk_window);
+
+    // TODO: X support
+    // if (GDK_IS_X11_DISPLAY(gdk_display)) {
+    //   gst_video_overlay_set_window_handle(gl_sink_, GDK_WINDOW_XID(gdk_window));
+    // }
+    if (GDK_IS_WAYLAND_DISPLAY(gdk_display)) {
+      gst_video_overlay_set_window_handle(GST_VIDEO_OVERLAY(gl_sink_),
+          reinterpret_cast<guintptr>(gdk_wayland_window_get_wl_surface(gdk_window)));
+      struct wl_display *dpy = gdk_wayland_display_get_wl_display(gdk_display);
+      GstContext *context = gst_context_new("GstWaylandDisplayHandleContextType", TRUE);
+      GstStructure *s = gst_context_writable_structure(context);
+      gst_structure_set(s, "display", G_TYPE_POINTER, dpy, NULL);
+      gst_element_set_context(gl_sink_, context);
+    } else {
+      CHECK(false) << "Only Wayland support right now";
+    }
+
+    g_signal_connect(gl_sink_, "client-draw", G_CALLBACK(GstWrapper::OnGlDraw), this);
+
+    gtk_widget_show_all(window_);
   }
 
   ::mediapipe::Status Start() {
@@ -130,6 +170,7 @@ public:
     MP_RETURN_IF_ERROR(graph_.StartRun({}));
 
     LOG(INFO) << "Setting GStreamer to PLAYING";
+    last_frame_ = absl::Now();
     gst_element_set_state(pipeline_, GST_STATE_PLAYING);
 
     // Wait until up and running or failed.
@@ -146,8 +187,11 @@ public:
 
   ~GstWrapper() {
     Stop();
+    gst_object_unref(gl_sink_);
     gst_object_unref(gst_gl_context_);
     gst_object_unref(pipeline_);
+    gtk_widget_destroy(window_);
+    gtk_widget_destroy(drawing_area_);
   }
 
   static GstPadProbeReturn OnPadProbeBuffer(GstPad *pad, GstPadProbeInfo *info, GstWrapper *self) {
@@ -160,6 +204,18 @@ public:
 
   static void OnPacketDestroy(mediapipe::Packet *packet) {
     delete packet;
+  }
+
+  static void OnWidgetConfigure(GtkWidget *widget, GdkEvent *event, GstWrapper *self) {
+    GtkAllocation allocation;
+    gtk_widget_get_allocation(widget, &allocation);
+    gst_video_overlay_set_render_rectangle(GST_VIDEO_OVERLAY(self->gl_sink_),
+        allocation.x, allocation.y, allocation.width, allocation.height);
+  }
+
+  static gboolean OnGlDraw(GstElement* object, GstGLContext* ctx, GstSample* sample, GstWrapper *self) {
+    gtk_widget_queue_draw(self->drawing_area_);
+    return FALSE;
   }
 
 private:
@@ -206,9 +262,11 @@ private:
 
     double since_last_ms = absl::ToDoubleMilliseconds(absl::Now() - last_frame_);
     last_frame_ = absl::Now();
-    LOG(INFO) << absl::StrFormat("tex %u %dx%d %.2f ms (%.2f fps)",
-        out_tex_id, out_width, out_height,
-        since_last_ms, 1000 / since_last_ms);
+
+    double avg = AverageFrameTime(since_last_ms);
+    LOG(INFO) << absl::StrFormat("%dx%d %.2f ms avg %.2f ms (%.2f fps)",
+        out_width, out_height, since_last_ms,
+        avg, 1000 / avg);
 
     // TODO: Wait on sync object in GST GL context.
 
@@ -261,16 +319,13 @@ private:
     // Clobber declared sink support for affine transformations so glvideoflip
     // gives us flipped buffer in the buffer probe.
     if (GST_QUERY_TYPE(query) == GST_QUERY_ALLOCATION) {
-      LOG(INFO) << "Forwarding allocation query";
       GstElement *element;
       GstPad *pad;
       CHECK(element = GST_ELEMENT(gst_bin_get_by_name(GST_BIN(pipeline_), "glsink")));
       CHECK(pad = gst_element_get_static_pad(element, "sink"));
       if (gst_pad_query(pad, query)) {
-        LOG(INFO) << "Sink query succeeded";
         guint index;
         if (gst_query_find_allocation_meta(query, GST_VIDEO_AFFINE_TRANSFORMATION_META_API_TYPE, &index)) {
-          LOG(INFO) << "Remove meta API at index " << index;
           gst_query_remove_nth_allocation_meta(query, index);
         }
       }
@@ -282,23 +337,42 @@ private:
     return GST_PAD_PROBE_OK;
   }
 
+  double AverageFrameTime(double sample) {
+    frame_times_.push_back(sample);
+    if (frame_times_.size() > 100) {
+      frame_times_.pop_front();
+    }
+    double sum = 0;
+    for (double val : frame_times_)
+        sum += val;
+    return sum / frame_times_.size();
+}
+
   mediapipe::CalculatorGraph graph_;
   mediapipe::StatusOrPoller status_or_poller_;
   mediapipe::GlCalculatorHelper gpu_helper_;
   GstElement *pipeline_ = nullptr;
+  GstElement *gl_sink_ = nullptr;
   GstGLContext *gst_gl_context_ = nullptr;
   size_t frame_timestamp_ = 0;  // TODO: Use real timestamp
   absl::Mutex mutex_;
   absl::Time last_frame_ = absl::Now();
+  std::list<double> frame_times_;
+  GtkWidget *window_ = nullptr;
+  GtkWidget *drawing_area_ = nullptr;
 };
 
 
 ::mediapipe::Status RunMPPGraph() {
+  gtk_init(nullptr, nullptr);
+
   GstWrapper gst;
   MP_RETURN_IF_ERROR(gst.Start());
 
-  std::string line;
-  std::getline(std::cin, line);
+  // TODO: call gtk_main_quit from a signal source
+  // selecting on stdin. Also call gtk_main_quit from
+  // window closed signal handler.
+  gtk_main();
   gst.Stop();
   return ::mediapipe::OkStatus();
 }
